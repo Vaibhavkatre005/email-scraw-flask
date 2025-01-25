@@ -1,62 +1,56 @@
 from flask import Flask, request, jsonify
-from scrapy.crawler import CrawlerProcess
+from scrapy.crawler import CrawlerRunner
 from scrapy.utils.project import get_project_settings
-import scrapy
-import re
+from twisted.internet import reactor
+from twisted.internet.defer import inlineCallbacks
+from scrapy import signals
+from scrapy.signalmanager import dispatcher
+import threading
 import json
-import os
 
 app = Flask(__name__)
 
-# Regular expression for emails
-EMAIL_REGEX = r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
+# Define a thread-safe way to run Scrapy
+class ScrapyThread(threading.Thread):
+    def __init__(self, runner, spider_cls, **kwargs):
+        threading.Thread.__init__(self)
+        self.runner = runner
+        self.spider_cls = spider_cls
+        self.kwargs = kwargs
+        self.items = []
 
-class EmailSpider(scrapy.Spider):
-    name = 'email_spider'
+    def run(self):
+        dispatcher.connect(self.item_scraped, signal=signals.item_scraped)
+        reactor.callFromThread(self.run_spider)
 
-    def __init__(self, url=None, *args, **kwargs):
-        super(EmailSpider, self).__init__(*args, **kwargs)
-        self.start_urls = [url] if url else []
+        if not reactor.running:
+            reactor.run(installSignalHandlers=False)
 
-    def parse(self, response):
-        # Extract all text content from the page
-        page_text = response.xpath('//body//text()').getall()
-        full_text = ' '.join(page_text)
+    def run_spider(self):
+        deferred = self.runner.crawl(self.spider_cls, **self.kwargs)
+        deferred.addBoth(lambda _: reactor.stop())
 
-        # Find all unique email addresses
-        emails = list(set(re.findall(EMAIL_REGEX, full_text)))
-
-        # Save emails to a JSON file
-        result = {'url': response.url, 'emails': emails}
-        output_file = 'emails.json'
-        with open(output_file, 'w') as f:
-            json.dump(result, f, indent=4)
-
-        self.log(f'Emails extracted and saved to {output_file}')
+    def item_scraped(self, item):
+        self.items.append(item)
 
 @app.route('/scrape', methods=['POST'])
 def scrape():
-    data = request.get_json()
-    url = data.get('url')
-
+    url = request.args.get('url')
     if not url:
-        return jsonify({'error': 'URL is required'}), 400
+        return jsonify({'error': 'URL parameter is required'}), 400
 
-    # Create a Scrapy CrawlerProcess
-    process = CrawlerProcess(get_project_settings())
+    settings = get_project_settings()
+    runner = CrawlerRunner(settings)
 
-    # Run the spider
-    process.crawl(EmailSpider, url=url)
-    process.start()  # Blocks until the spider finishes
+    # Import your Scrapy spider class here
+    from your_project.spiders.your_spider import YourSpider
 
-    # Read the result from the JSON file
-    if os.path.exists('emails.json'):
-        with open('emails.json', 'r') as f:
-            result = json.load(f)
-        os.remove('emails.json')  # Clean up the file
-        return jsonify(result), 200
-    else:
-        return jsonify({'error': 'Failed to scrape emails'}), 500
+    # Create and start ScrapyThread
+    scrapy_thread = ScrapyThread(runner, YourSpider, start_urls=[url])
+    scrapy_thread.start()
+    scrapy_thread.join()
 
-if __name__ == '__main__':
-    app.run(debug=True)
+    return jsonify(scrapy_thread.items)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
